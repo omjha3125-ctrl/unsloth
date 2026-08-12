@@ -420,6 +420,7 @@ class _FakeComponentsManager:
 class _FakeModularPipe:
     def __init__(self) -> None:
         self.scheduler = _FakeH3Scheduler()
+        self.transformer = object()
         self.load_kwargs = None
         self.last_kwargs = None
 
@@ -3681,6 +3682,67 @@ def test_h3_modular_load_forwards_the_hub_token_to_the_component_loads(fake_runt
     # Without a configured token nothing extra is passed, so the hub's own resolution still applies.
     pipe = _load_h3_modular(VideoBackend())
     assert "token" not in pipe.load_kwargs
+
+
+def test_h3_turbo_env_applies_adapter_and_uses_nfe_plus_terminal_sigma(
+    fake_runtime, monkeypatch, tmp_path
+):
+    from core.inference import video_minimax_h3_turbo as turbo
+
+    lora = tmp_path / "minimax_h3_turbo.safetensors"
+    lora.write_bytes(b"placeholder")
+    monkeypatch.setenv(turbo.H3_TURBO_LORA_ENV, str(lora))
+    monkeypatch.setenv(turbo.H3_TURBO_STEPS_ENV, "4")
+    seen = {}
+
+    def _apply(transformer, config, *, logger = None):
+        seen["transformer"] = transformer
+        seen["config"] = config
+        return 8
+
+    monkeypatch.setattr(turbo, "apply_h3_turbo_lora", _apply)
+    backend = VideoBackend()
+    pipe = _load_h3_modular(backend)
+
+    assert seen["transformer"] is pipe.transformer
+    assert seen["config"].path == lora.resolve()
+    assert backend.status()["h3_turbo"] == {"lora": lora.name, "nfe": 4}
+    assert backend.status()["defaults"]["steps"] == 4
+
+    backend.generate(prompt = "a fox", steps = 4)
+    # MiniMaxH3Scheduler's public count includes terminal sigma=0, so 4 transformer
+    # evaluations are represented by five scheduler grid points.
+    assert pipe.last_kwargs["num_inference_steps"] == 5
+
+
+def test_h3_turbo_env_rejects_ref2va_before_loading_components(fake_runtime, monkeypatch, tmp_path):
+    from core.inference import video_minimax_h3_turbo as turbo
+
+    lora = tmp_path / "minimax_h3_turbo.safetensors"
+    lora.write_bytes(b"placeholder")
+    monkeypatch.setenv(turbo.H3_TURBO_LORA_ENV, str(lora))
+    backend = VideoBackend()
+    diffusers = sys.modules["diffusers"]
+    diffusers.ComponentsManager = _FakeComponentsManager
+    diffusers.ModularPipeline = _FakeModularPipeline
+    fam = _detect_load_family("MiniMaxAI/MiniMax-H3", None, "minimax-h3")
+
+    with pytest.raises(ValueError, match = "Ref2VA uses a different transformer partition"):
+        backend._load_h3_modular_pipeline(
+            diffusers = diffusers,
+            torch = sys.modules["torch"],
+            fam = fam,
+            repo_id = "MiniMaxAI/MiniMax-H3",
+            base = fam.base_repo,
+            kind = "pipeline",
+            dtype = sys.modules["torch"].bfloat16,
+            device = "cpu",
+            hf_token = None,
+            memory_mode = None,
+            h3_task = "ref2va",
+            _load_token = None,
+            _base_local_dir = None,
+        )
 
 
 def test_h3_modular_load_pins_the_component_loads_to_the_studio_cache(fake_runtime):

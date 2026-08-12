@@ -470,6 +470,10 @@ class _VideoLoadState:
     gguf_filename: Optional[str] = None
     # Resident MiniMax-H3 denoiser partition, if any.
     h3_task: Optional[str] = None
+    # Experimental pure-PEFT Turbo adapter applied to the H3 Diffusers denoiser. The public
+    # request surface does not expose this yet; Patch 1 opts in through UNSLOTH_H3_TURBO_* envs.
+    h3_turbo_lora: Optional[str] = None
+    h3_turbo_nfe: Optional[int] = None
     offload_policy: str = "none"
     vae_tiling: bool = True
     memory_mode: str = "auto"
@@ -3732,6 +3736,14 @@ class VideoBackend:
         text_encoder_quant_is_auto = _h3_precision_unset(text_encoder_quant)
         # Load one denoiser partition. fl2va also covers text-only generation.
         workflow = h3_task or fam.modular_workflow
+        from .video_minimax_h3_turbo import h3_turbo_config_from_env
+
+        h3_turbo = h3_turbo_config_from_env()
+        if h3_turbo is not None and workflow == H3_TASK_REFERENCES:
+            raise ValueError(
+                "MiniMax-H3 Turbo LoRA Patch 1 supports the shared T2VA/I2VA/FL2VA denoiser "
+                "only; Ref2VA uses a different transformer partition."
+            )
         # Which component this workflow's denoise step reads. One repo, two partitions: seeding
         # the wrong attribute leaves the block with no denoiser AND has load_components fetch the
         # dense 66.28 GB partition the seed was meant to replace.
@@ -4065,6 +4077,20 @@ class VideoBackend:
             cache_dir = hub_cache_dir(),
             **({"token": hf_token} if hf_token else {}),
         )
+        if h3_turbo is not None:
+            from .video_minimax_h3_turbo import apply_h3_turbo_lora
+
+            denoiser_for_lora = getattr(pipe, denoiser_component, None)
+            if denoiser_for_lora is None:
+                raise RuntimeError(
+                    f"MiniMax-H3 Turbo LoRA cannot find the resident {denoiser_component} component."
+                )
+            if h3_turbo.fuse and transformer_quant_engaged is not None:
+                raise ValueError(
+                    "UNSLOTH_H3_TURBO_FUSE=1 is not supported on a hosted quantized H3 "
+                    "denoiser in Patch 1. Leave fusion off so the adapter remains separate."
+                )
+            apply_h3_turbo_lora(denoiser_for_lora, h3_turbo, logger = logger)
         # The video VAE loads at float32 and the decode runs under float16 autocast, so both
         # copies are resident for the whole decode. Pre-casting the decoder removes the pair
         # without changing a single output value. The encoder stays resident because the
@@ -4315,6 +4341,11 @@ class VideoBackend:
                     text_encoder_quant_engaged or "off",
                     text_encoder_quant_reason,
                 ),
+                "h3_turbo_lora": (
+                    str(h3_turbo.path) if h3_turbo is not None else None,
+                    h3_turbo.path.name if h3_turbo is not None else "off",
+                    "experimental pure-PEFT H3 Turbo adapter from UNSLOTH_H3_TURBO_LORA",
+                ),
             }
         )
         with self._lock:
@@ -4332,6 +4363,8 @@ class VideoBackend:
                 kind = kind,
                 engine = "diffusers",
                 h3_task = workflow,
+                h3_turbo_lora = h3_turbo.path.name if h3_turbo is not None else None,
+                h3_turbo_nfe = h3_turbo.nfe if h3_turbo is not None else None,
                 offload_policy = offload_policy,
                 vae_tiling = True,
                 memory_mode = normalize_memory_mode(memory_mode),
@@ -4705,7 +4738,10 @@ class VideoBackend:
                     state.base_repo,
                     fallback = (fam.default_steps, fam.default_guidance),
                 )
-                steps = int(steps or default_steps)
+                if state.h3_turbo_lora is not None and steps is None:
+                    steps = int(state.h3_turbo_nfe or 4)
+                else:
+                    steps = int(steps or default_steps)
                 guidance = float(default_guidance if guidance is None else guidance)
                 # A guidance-free family (supports_cfg=False, MiniMax-H3) forwards no CFG control
                 # to either engine: the diffusers branch below skips the kwarg entirely and the
@@ -4850,13 +4886,19 @@ class VideoBackend:
                     "dtype": state.dtype,
                     "offload": state.offload_policy,
                     "attention_backend": state.attention_backend,
+                    "h3_turbo_lora": state.h3_turbo_lora,
                 }
 
                 pipe = state.pipe
                 call_params = inspect.signature(pipe.__call__).parameters
+                scheduler_steps = steps
+                if fam.modular_workflow and state.h3_turbo_lora is not None:
+                    from .video_minimax_h3_turbo import h3_turbo_scheduler_grid_points
+
+                    scheduler_steps = h3_turbo_scheduler_grid_points(steps)
                 kwargs: dict[str, Any] = {
                     "prompt": prompt,
-                    "num_inference_steps": steps,
+                    "num_inference_steps": scheduler_steps,
                     "width": width,
                     "height": height,
                     "num_frames": frames,
@@ -5574,6 +5616,7 @@ class VideoBackend:
                 "supports_keyframes": False,
                 "supports_references": False,
                 "h3_task": None,
+                "h3_turbo": None,
                 "defaults": None,
                 "resolved": None,
             }
@@ -5616,8 +5659,13 @@ class VideoBackend:
             "supports_keyframes": fam.supports_keyframes and state.h3_task != H3_TASK_REFERENCES,
             "supports_references": fam.supports_references and state.h3_task == H3_TASK_REFERENCES,
             "h3_task": state.h3_task,
+            "h3_turbo": (
+                {"lora": state.h3_turbo_lora, "nfe": state.h3_turbo_nfe}
+                if state.h3_turbo_lora is not None
+                else None
+            ),
             "defaults": {
-                "steps": default_steps,
+                "steps": state.h3_turbo_nfe or default_steps,
                 "guidance": default_guidance,
                 "num_frames": fam.default_num_frames,
                 "fps": fam.default_fps,
