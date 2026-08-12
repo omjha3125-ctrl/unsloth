@@ -474,6 +474,10 @@ class _VideoLoadState:
     # request surface does not expose this yet; Patch 1 opts in through UNSLOTH_H3_TURBO_* envs.
     h3_turbo_lora: Optional[str] = None
     h3_turbo_nfe: Optional[int] = None
+    # Optional external Python 3.12/SageAttention runtime probe. Patch 2 only validates the
+    # worker environment before a heavyweight H3 load; generation is still handled by the
+    # resident Diffusers pipeline until the worker gains an explicit generation contract.
+    h3_worker: Optional[dict[str, Any]] = None
     offload_policy: str = "none"
     vae_tiling: bool = True
     memory_mode: str = "auto"
@@ -3739,11 +3743,30 @@ class VideoBackend:
         from .video_minimax_h3_turbo import h3_turbo_config_from_env
 
         h3_turbo = h3_turbo_config_from_env()
+        h3_worker = None
+        h3_worker_python = None
         if h3_turbo is not None and workflow == H3_TASK_REFERENCES:
             raise ValueError(
                 "MiniMax-H3 Turbo LoRA Patch 1 supports the shared T2VA/I2VA/FL2VA denoiser "
                 "only; Ref2VA uses a different transformer partition."
             )
+        if h3_turbo is not None:
+            # Keep the known-good SageAttention runtime isolated from Studio's pinned Python.
+            # This is deliberately a PRE-FLIGHT only in Patch 2: it proves that the external
+            # interpreter can execute the real Sage 2.2 Triton kernel and read the real Turbo
+            # adapter before Studio spends minutes downloading/loading the H3 components.
+            from .video_minimax_h3_worker import (
+                h3_worker_python_from_env,
+                probe_h3_worker,
+            )
+
+            h3_worker_python = h3_worker_python_from_env()
+            if h3_worker_python is not None:
+                h3_worker = probe_h3_worker(
+                    h3_worker_python,
+                    lora_path = h3_turbo.path,
+                    nfe = h3_turbo.nfe,
+                )
         # Which component this workflow's denoise step reads. One repo, two partitions: seeding
         # the wrong attribute leaves the block with no denoiser AND has load_components fetch the
         # dense 66.28 GB partition the seed was meant to replace.
@@ -4346,6 +4369,12 @@ class VideoBackend:
                     h3_turbo.path.name if h3_turbo is not None else "off",
                     "experimental pure-PEFT H3 Turbo adapter from UNSLOTH_H3_TURBO_LORA",
                 ),
+                "h3_torch_worker": (
+                    str(h3_worker_python) if h3_worker_python is not None else None,
+                    h3_worker.get("python") if h3_worker is not None else "off",
+                    "external SageAttention/Turbo runtime preflight only; generation still runs "
+                    "inside Studio in Patch 2",
+                ),
             }
         )
         with self._lock:
@@ -4365,6 +4394,7 @@ class VideoBackend:
                 h3_task = workflow,
                 h3_turbo_lora = h3_turbo.path.name if h3_turbo is not None else None,
                 h3_turbo_nfe = h3_turbo.nfe if h3_turbo is not None else None,
+                h3_worker = h3_worker,
                 offload_policy = offload_policy,
                 vae_tiling = True,
                 memory_mode = normalize_memory_mode(memory_mode),
@@ -5617,6 +5647,7 @@ class VideoBackend:
                 "supports_references": False,
                 "h3_task": None,
                 "h3_turbo": None,
+                "h3_worker": None,
                 "defaults": None,
                 "resolved": None,
             }
@@ -5664,6 +5695,7 @@ class VideoBackend:
                 if state.h3_turbo_lora is not None
                 else None
             ),
+            "h3_worker": dict(state.h3_worker) if state.h3_worker is not None else None,
             "defaults": {
                 "steps": state.h3_turbo_nfe or default_steps,
                 "guidance": default_guidance,

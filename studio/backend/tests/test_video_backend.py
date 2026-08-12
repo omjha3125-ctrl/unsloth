@@ -3715,6 +3715,92 @@ def test_h3_turbo_env_applies_adapter_and_uses_nfe_plus_terminal_sigma(
     assert pipe.last_kwargs["num_inference_steps"] == 5
 
 
+def test_h3_turbo_worker_preflight_is_recorded_before_h3_load(
+    fake_runtime, monkeypatch, tmp_path
+):
+    from core.inference import video_minimax_h3_turbo as turbo
+    from core.inference import video_minimax_h3_worker as worker
+
+    lora = tmp_path / "minimax_h3_turbo.safetensors"
+    lora.write_bytes(b"placeholder")
+    python = tmp_path / "python3"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    monkeypatch.setenv(turbo.H3_TURBO_LORA_ENV, str(lora))
+    monkeypatch.setenv(worker.H3_WORKER_PYTHON_ENV, str(python))
+    monkeypatch.setattr(turbo, "apply_h3_turbo_lora", lambda *_args, **_kwargs: 128)
+    seen = {}
+
+    def _probe(python_path, *, lora_path, nfe, timeout = None):
+        seen.update(python = python_path, lora = lora_path, nfe = nfe, timeout = timeout)
+        return {
+            "ok": True,
+            "python": str(python.resolve()),
+            "python_version": "3.12.13",
+            "torch": "2.12.1+cu130",
+            "cuda": "13.0",
+            "triton": "3.7.1",
+            "sage_kernel": "sageattn_qk_int8_pv_fp16_triton",
+            "gpu": "NVIDIA RTX A6000",
+            "compute_capability": [8, 6],
+            "lora": {"name": lora.name, "tensor_count": 624, "rank": 128},
+            "nfe": 4,
+        }
+
+    monkeypatch.setattr(worker, "probe_h3_worker", _probe)
+    backend = VideoBackend()
+    _load_h3_modular(backend)
+
+    assert seen == {
+        "python": python.resolve(),
+        "lora": lora.resolve(),
+        "nfe": 4,
+        "timeout": None,
+    }
+    status = backend.status()
+    assert status["h3_worker"]["sage_kernel"] == "sageattn_qk_int8_pv_fp16_triton"
+    assert status["h3_worker"]["lora"]["rank"] == 128
+
+
+def test_h3_turbo_worker_controller_parses_structured_probe(monkeypatch, tmp_path):
+    from core.inference import video_minimax_h3_worker as worker
+
+    python = tmp_path / "python3"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    lora = tmp_path / "turbo.safetensors"
+    lora.write_bytes(b"placeholder")
+    monkeypatch.setenv(worker.H3_WORKER_PYTHON_ENV, str(python))
+
+    completed = types.SimpleNamespace(
+        returncode = 0,
+        stdout = 'diagnostic\n{"ok":true,"python":"/usr/bin/python3","nfe":4}\n',
+        stderr = "",
+    )
+    seen = {}
+
+    def _run(command, **kwargs):
+        seen["command"] = command
+        seen.update(kwargs)
+        return completed
+
+    monkeypatch.setattr(worker.subprocess, "run", _run)
+    resolved = worker.h3_worker_python_from_env()
+    assert resolved == python.resolve()
+    result = worker.probe_h3_worker(resolved, lora_path = lora, nfe = 4, timeout = 12)
+
+    assert result == {"ok": True, "python": "/usr/bin/python3", "nfe": 4}
+    assert seen["command"][0] == str(python.resolve())
+    assert seen["command"][-1] == "--worker"
+    assert seen["timeout"] == 12
+    assert seen["capture_output"] is True
+    assert seen["text"] is True
+    assert seen["check"] is False
+    assert "shell" not in seen
+    payload = __import__("json").loads(seen["input"])
+    assert payload == {"action": "probe", "lora_path": str(lora.resolve()), "nfe": 4}
+
+
 def test_h3_turbo_env_rejects_ref2va_before_loading_components(fake_runtime, monkeypatch, tmp_path):
     from core.inference import video_minimax_h3_turbo as turbo
 
